@@ -177,6 +177,63 @@ Agent          Gateway         Interceptor       Databricks       Databricks
 | Secrets | SP creds in Secrets Manager | Encrypted at rest, auto-refreshed |
 | User token | Exists only in Lambda memory | Never stored, never logged, never returned |
 
+## Widening to the other Managed MCP servers
+
+The interceptor is endpoint-agnostic. It swaps the outbound `Authorization` header, so the same Lambda carries the user's identity to **any** Databricks Managed MCP server — not just DBSQL. Adding a surface means adding a gateway target that points at a different path; the interceptor needs no change.
+
+| Surface | MCP path |
+|---|---|
+| DBSQL | `/api/2.0/mcp/sql` |
+| Unity Catalog functions | `/api/2.0/mcp/functions/{catalog}/{schema}` |
+| Genie | `/api/2.0/mcp/genie/{genie_space_id}` |
+| Vector Search | `/api/2.0/mcp/ai-search/{catalog}/{schema}/{index_name}` |
+
+Two path details that cause 404s: the vector-search segment is **`ai-search`**, not `vector-search`; and the functions path is **schema-level** — there is no trailing `/{function_name}`.
+
+### Where governance is enforced differs per surface
+
+Carrying the user's identity is necessary but not sufficient — what the identity *buys* you is not the same everywhere. This matters when designing an agent, because on one surface an ungranted tool disappears from the model's tool list, and on another it is offered and then fails at call time.
+
+| Surface | `tools/list` gated by | Call gated by |
+|---|---|---|
+| Unity Catalog functions | **`EXECUTE` grant** — an ungranted function is *absent* from the list | `EXECUTE` grant |
+| DBSQL | nothing — the same three tools are returned to every caller | **row filters and column masks**, applied at query time |
+| Genie | **the Genie space ACL** (`CAN_VIEW` / `CAN_RUN`), checked before Unity Catalog | space ACL, then Unity Catalog on the underlying tables |
+| Vector Search | index-level grant | index-level grant only — see the caveat below |
+
+The functions surface has the strongest property: a caller without `EXECUTE` never learns the tool exists, so the model cannot attempt it and no denial has to be explained. Genie is the opposite shape — a workspace object ACL is checked first, so a caller without space permission fails at `tools/list` with `PERMISSION_DENIED` rather than receiving an empty list.
+
+### Vector Search: row and column permissions do not propagate
+
+A row filter or column mask on a source Delta table **does not** carry into a Vector Search index synced from it. Databricks documents row and column level permissions as unsupported for Vector Search. An index inherits neither, so per-user row scoping cannot be delegated to Unity Catalog on this surface.
+
+This is worth stating plainly because the natural assumption — that governance follows the data — produces a demo that appears to work while returning identical rows to every user.
+
+Scope retrieval per user in the query instead, with the index's `filters` argument:
+
+```python
+index.similarity_search(
+    query_text=question,
+    columns=["chunk", "region"],
+    filters={"region": caller_region},   # derived from the caller's identity, not from UC
+    num_results=5,
+)
+```
+
+Two consequences to design around: the filter is application-enforced, so it belongs on a trusted server-side path rather than anywhere the model can influence; and the value it filters on has to come from the verified identity, not from the model's arguments. If per-user row scoping is a hard requirement, putting the sensitive columns behind a Unity Catalog function or a governed table — where filters and masks do apply — is the stronger design.
+
+### How the table above was established
+
+The three measured rows were produced with two Databricks service principals holding differential grants, each calling the endpoints above with its own token, on a workspace running Managed MCP:
+
+- **Functions** — one principal held `EXECUTE` on two functions, the other on one. `tools/list` returned two tools and one tool respectively; the ungranted function was absent rather than present-and-denied.
+- **DBSQL** — both principals received the identical three tools. A `SELECT` over the same table then returned disjoint row sets, with a masked column for one principal and the raw value for the other.
+- **Genie** — with no space grant, both principals failed `tools/list` with `PERMISSION_DENIED`. After granting `CAN_RUN` to one, that principal received two tools while the other continued to be refused.
+
+The Vector Search row is from Databricks' documentation rather than measurement. Genie's second layer — Unity Catalog grants on the tables behind the space — is the same mechanism demonstrated on DBSQL but was not separately measured.
+
+Managed MCP is in Public Preview at the time of writing; treat surface behaviour as subject to change.
+
 ## Gotchas
 
 1. **Token version matters.** Entra v1.0 tokens use `iss: sts.windows.net`. Use v1.0 discovery URL for Gateway. Use `sts.windows.net` issuer for the Databricks federation policy.
