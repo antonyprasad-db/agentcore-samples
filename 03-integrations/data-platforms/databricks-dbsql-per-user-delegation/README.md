@@ -183,6 +183,23 @@ The interceptor does not inspect the MCP path — it only swaps the outbound `Au
 
 It is also not tied to Microsoft Entra. The interceptor decodes claims and performs an RFC 8693 exchange, so any OIDC issuer works in principle. Verified as far as decoding: driving the interceptor with an Amazon Cognito ID token, it read the `email` claim and attempted the exchange exactly as it does for an Entra token. Switching issuers is not free, though — it needs both a new `authorizerConfiguration` on the gateway (the walkthrough pins Entra's `discoveryUrl` and `allowedAudience`) and a Databricks federation policy for the new issuer.
 
+### Why the interceptor is still needed
+
+Gateway has since gained native on-behalf-of token exchange — the `TOKEN_EXCHANGE` grant type, with `onBehalfOfTokenExchangeConfig` on the credential provider — so the reasonable question is why this sample still routes through a Lambda.
+
+Because it does not work against Databricks, for a specific reason. Databricks' account federation exchange requires the request to carry **no client authentication**; sending any makes it fail. AgentCore's `ClientAuthenticationMethodType` has no equivalent of *none*: the options are `CLIENT_SECRET_BASIC`, `CLIENT_SECRET_POST`, `AWS_IAM_ID_TOKEN_JWT` and `PRIVATE_KEY_JWT`, and omitting the field falls back to a client-secret method that then requires a `clientId` and `clientSecret`.
+
+Measured, same issuer and audience against a federation policy that works:
+
+| Exchange | Result |
+|---|---|
+| Direct, no client authentication | `200` and a per-user token |
+| Direct, with client authentication | `401` |
+| Native `TOKEN_EXCHANGE`, `AWS_IAM_ID_TOKEN_JWT` | `401` |
+| Native `TOKEN_EXCHANGE`, `CLIENT_SECRET_POST` | `401` |
+
+The `401` is client authentication being rejected rather than a policy problem; a missing federation policy returns `400 invalid_grant` instead. So the Lambda is not working around a missing grant type any more — it is working around the fact that the exchange cannot be made unauthenticated.
+
 > **What is verified here, and what is not.** Three rows of the governance table were measured; the AI Search row is from Databricks documentation, and Genie's Unity Catalog layer is inferred. Each row is labelled. Crucially, those measurements were taken **calling the Managed MCP endpoints directly** with each principal's own token — **not** through an AgentCore Gateway. [What changes behind a Gateway](#what-changes-behind-a-gateway) covers the difference, which is significant for the functions surface. The gateway wiring for the additional surfaces has not been exercised end to end; treat the registration snippet as the pattern to follow, not as run code.
 
 | Surface | MCP path | OAuth scope |
@@ -244,18 +261,20 @@ for name, path in surfaces.items():
         target_ids.append(target["targetId"])
     except agentcore.exceptions.ConflictException:
         # Re-runnable: adopt the existing target instead of aborting the rest.
+        # list_gateway_targets paginates, so page through rather than assuming
+        # the target is in the first response.
+        pages = agentcore.get_paginator("list_gateway_targets").paginate(
+            gatewayIdentifier=gateway_id
+        )
         existing = next(
-            t for t in agentcore.list_gateway_targets(gatewayIdentifier=gateway_id)["items"]
-            if t["name"] == name
+            t for page in pages for t in page["items"] if t["name"] == name
         )
         target_ids.append(existing["targetId"])
 
-# Wait for READY. Status values are upper case; these are the transient ones, and
-# anything else that is not READY is terminal.
-TRANSIENT = {
-    "CREATING", "UPDATING", "SYNCHRONIZING",
-    "CREATE_PENDING_AUTH", "UPDATE_PENDING_AUTH", "SYNCHRONIZE_PENDING_AUTH",
-}
+# Wait for READY. Status values are upper case. Only these resolve on their own;
+# the *_PENDING_AUTH states wait on out-of-band OAuth consent, so polling them just
+# burns the timeout -- fail fast and surface them instead.
+TRANSIENT = {"CREATING", "UPDATING", "SYNCHRONIZING"}
 for name, target_id in zip(surfaces, target_ids):
     status = None
     for _ in range(24):
@@ -293,14 +312,14 @@ The visibility column above does **not** survive a gateway, and this is worth de
 
 Two mechanisms combine:
 
-- **Tool listing is served from an SP-built cache.** `mcpServer.listingMode` defaults to `DEFAULT`, documented as: *"MCP resources for default targets are cached at the control plane for faster access. MCP resources for dynamic targets will be dynamically retrieved when listing tools."* The cache is populated by `synchronize_gateway_targets`, which authenticates as the credential provider's service principal — the walkthrough's own control-plane diagram says exactly this.
+- **Tool listing is served from an SP-built cache.** *"Unless changed, Listing Mode is set to DEFAULT"*, and in `DEFAULT` mode capabilities are discovered through synchronization. That happens implicitly on `CreateGatewayTarget` and `UpdateGatewayTarget` as well as on an explicit `SynchronizeGatewayTargets` call, and it authenticates as the credential provider: *"No inbound user token exists during these control plane operations, so the synchronization uses the machine-to-machine token instead of on-behalf-of token exchange."* The walkthrough's own control-plane diagram says the same thing.
 - **The interceptor deliberately does not touch listing.** It returns early for `tools/list` without swapping the header, so even with `listingMode="DYNAMIC"` the upstream list is fetched with the SP's token, never the caller's.
 
 So every caller sees the tools the *service principal* can see. On the functions surface a user with no `EXECUTE` is still offered the tool and gets a denial when the call reaches Unity Catalog — the inverse of the direct-call behaviour. In effect a gateway collapses the functions surface into the DBSQL shape: no visibility gate, enforcement at call time.
 
 Call-time enforcement is unaffected, because that is the leg the interceptor rewrites. Per-user *data* access still holds on every surface. It is only per-user *tool visibility* that does not.
 
-Getting visibility back would take `listingMode="DYNAMIC"` **and** an interceptor that exchanges the token for `tools/list` too, instead of passing it through. I have not tried that combination, and whether it is supported is a question for the AgentCore team rather than an assumption to build on.
+Per-caller listing is documented, via `listingMode="DYNAMIC"`: *"In DYNAMIC mode, the gateway discovers the MCP server's capabilities at invocation time. Because an inbound user token is present and can be exchanged at that point, the gateway requires no control plane background synchronization."* Note the tradeoff — *"Currently DYNAMIC mode is not interoperable with semantic search or outbound three-legged OAuth (3LO)"* — and that this sample's interceptor would also need to stop passing `tools/list` through untouched. I have not exercised that combination.
 
 ### AI Search: row and column permissions are not part of the picture
 
@@ -320,7 +339,7 @@ Scoping it yourself means the `_meta` block on the tool call, which Databricks d
   "_meta": {
     "filters": "{\"region\": \"EMEA\"}",
     "num_results": 5,
-    "columns": ["chunk", "region"]
+    "columns": "chunk,region"
   }
 }
 ```
@@ -334,7 +353,7 @@ The measured rows were produced with two Databricks service principals holding d
 - **Functions** — one principal held `EXECUTE` on two functions, the other on one. On the schema-level path, `tools/list` returned two tools and one tool respectively; the ungranted function was absent rather than present-and-denied. On the per-function path for the ungranted function, the same principal received `BAD_REQUEST: Function '…' not found` — reported as nonexistent rather than forbidden, the same visibility property expressed as an error.
 - **Both functions path forms** — schema-level returned every `EXECUTE`-granted function in the schema; the per-function form returned exactly the one named. Both are live.
 - **DBSQL** — both principals received the identical three tools. A `SELECT` over the same table then returned disjoint row sets, with a masked column for one principal and the raw value for the other.
-- **Genie** — with no space grant, both principals failed `tools/list` with `PERMISSION_DENIED`. Granting `CAN_RUN` to one and `CAN_READ` to the other gave both the same two tools: `CAN_READ` is enough to list. The user-facing "Can View" wording in the denial corresponds to `CAN_READ` at the permissions API, which has no `CAN_VIEW` level.
+- **Genie** — with no space grant, both principals failed `tools/list` with `PERMISSION_DENIED`. Granting `CAN_RUN` to one and `CAN_READ` to the other gave both the same two tools: `CAN_READ` is enough to list. The user-facing "Can View" wording in the denial and in the Databricks UI corresponds to `CAN_READ` at the permissions API, whose enum has no `CAN_VIEW` member.
 
 The AI Search row is from Databricks' documentation rather than measurement. Genie's second layer — Unity Catalog grants on the tables behind the space — is the same mechanism demonstrated on DBSQL but was not separately measured. Genie One was not exercised. The gateway behaviour in [What changes behind a Gateway](#what-changes-behind-a-gateway) is derived from the AgentCore API contract and the interceptor's source, not from a running gateway.
 
