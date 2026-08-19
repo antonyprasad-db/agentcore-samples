@@ -179,7 +179,9 @@ Agent          Gateway         Interceptor       Databricks       Databricks
 
 ## Widening to the other Managed MCP servers
 
-The interceptor is endpoint-agnostic. It swaps the outbound `Authorization` header, so the same Lambda carries the user's identity to **any** Databricks Managed MCP server — not just DBSQL. Adding a surface means adding a gateway target that points at a different path; the interceptor needs no change.
+The interceptor is endpoint-agnostic by construction. It swaps the outbound `Authorization` header and does not inspect the MCP path, so the same Lambda should carry the user's identity to any Databricks Managed MCP server — not just DBSQL. Adding a surface means adding a gateway target that points at a different path; the interceptor needs no change.
+
+> **Status of this section.** The governance table below is measured directly against the Databricks Managed MCP endpoints (see [How the table above was established](#how-the-table-above-was-established)). The gateway wiring for the three additional surfaces is *not* yet exercised end-to-end through a Gateway plus interceptor — only the DBSQL target in the walkthrough above is. Treat the registration snippet as the pattern to follow, not as run code.
 
 | Surface | MCP path |
 |---|---|
@@ -189,6 +191,48 @@ The interceptor is endpoint-agnostic. It swaps the outbound `Authorization` head
 | Vector Search | `/api/2.0/mcp/ai-search/{catalog}/{schema}/{index_name}` |
 
 Two path details that cause 404s: the vector-search segment is **`ai-search`**, not `vector-search`; and the functions path is **schema-level** — there is no trailing `/{function_name}`.
+
+### Registering the additional targets
+
+Each surface is its own gateway target sharing the one credential provider and the one interceptor. Extending the walkthrough's single `create_gateway_target` call:
+
+```python
+surfaces = {
+    "databricks-sql":       "/api/2.0/mcp/sql",
+    "databricks-functions": f"/api/2.0/mcp/functions/{CATALOG}/{SCHEMA}",
+    "databricks-genie":     f"/api/2.0/mcp/genie/{GENIE_SPACE_ID}",
+    "databricks-vector":    f"/api/2.0/mcp/ai-search/{CATALOG}/{SCHEMA}/{INDEX_NAME}",
+}
+
+target_ids = []
+for name, path in surfaces.items():
+    target = agentcore.create_gateway_target(
+        gatewayIdentifier=gateway_id,
+        name=name,
+        description=f"Databricks Managed MCP ({name}) — per-user via interceptor",
+        targetConfiguration={"mcp": {"mcpServer": {"endpoint": f"{DATABRICKS_HOST}{path}"}}},
+        credentialProviderConfigurations=[
+            {
+                "credentialProviderType": "OAUTH",
+                "credentialProvider": {
+                    "oauthCredentialProvider": {
+                        "providerArn": provider_arn,
+                        "grantType": "CLIENT_CREDENTIALS",
+                        "scopes": ["all-apis"],
+                    }
+                },
+            }
+        ],
+    )
+    target_ids.append(target["targetId"])
+
+# Wait for each target to leave Creating/Updating, then sync them together.
+agentcore.synchronize_gateway_targets(
+    gatewayIdentifier=gateway_id, targetIdList=target_ids
+)
+```
+
+The service principal behind `provider_arn` is what performs `tools/list` at sync time, so it needs enough grant to *see* each surface: `EXECUTE` on the functions you want listed, and `CAN_VIEW` or better on the Genie space. A surface the SP cannot see syncs zero tools — the failure is silent for functions (empty list) and loud for Genie (`PERMISSION_DENIED`), which is the same asymmetry the table below describes.
 
 ### Where governance is enforced differs per surface
 
