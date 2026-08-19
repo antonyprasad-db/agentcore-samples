@@ -179,9 +179,11 @@ Agent          Gateway         Interceptor       Databricks       Databricks
 
 ## Widening to the other Managed MCP servers
 
-The interceptor is endpoint-agnostic by construction. It swaps the outbound `Authorization` header and does not inspect the MCP path, so the same Lambda should carry the user's identity to any Databricks Managed MCP server — not just DBSQL. Adding a surface means adding a gateway target that points at a different path; the interceptor needs no change.
+The interceptor does not inspect the MCP path — it only swaps the outbound `Authorization` header — so the same Lambda works for any Databricks Managed MCP server. Adding a surface means adding a gateway target that points at a different path.
 
-> **What is verified here.** The governance behaviour in the table below was measured directly against the Databricks Managed MCP endpoints with differentially-granted principals, and each row is labelled with its basis. The **gateway wiring** for the additional surfaces is *not* yet exercised end-to-end through a Gateway plus interceptor — only the DBSQL target in the walkthrough above is. Treat the registration snippet as the pattern to follow, not as run code.
+It is also not tied to Microsoft Entra. The interceptor decodes claims and performs an RFC 8693 exchange, so any OIDC issuer works in principle. Verified as far as decoding: driving the interceptor with an Amazon Cognito ID token, it read the `email` claim and attempted the exchange exactly as it does for an Entra token. Switching issuers is not free, though — it needs both a new `authorizerConfiguration` on the gateway (the walkthrough pins Entra's `discoveryUrl` and `allowedAudience`) and a Databricks federation policy for the new issuer.
+
+> **What is verified here, and what is not.** Three rows of the governance table were measured; the AI Search row is from Databricks documentation, and Genie's Unity Catalog layer is inferred. Each row is labelled. Crucially, those measurements were taken **calling the Managed MCP endpoints directly** with each principal's own token — **not** through an AgentCore Gateway. [What changes behind a Gateway](#what-changes-behind-a-gateway) covers the difference, which is significant for the functions surface. The gateway wiring for the additional surfaces has not been exercised end to end; treat the registration snippet as the pattern to follow, not as run code.
 
 | Surface | MCP path | OAuth scope |
 |---|---|---|
@@ -191,14 +193,18 @@ The interceptor is endpoint-agnostic by construction. It swaps the outbound `Aut
 | Genie One, workspace-wide | `/api/2.0/mcp/genie` | `genie` |
 | AI Search (formerly Vector Search) | `/api/2.0/mcp/ai-search/{catalog}/{schema}/{index_name}` | `ai-search` |
 
-Two details on these paths:
+Paths and scopes are from the Databricks reference table. The DBSQL, functions and per-space Genie paths were additionally exercised directly; Genie One and AI Search were not.
 
-- **AI Search** is the current prefix, but the former `/api/2.0/mcp/vector-search/` prefix and `vector-search` scope still work. There is no need to rewrite a working target — prefer `ai-search` in new code to match the docs.
-- **Unity Catalog functions accepts two path forms**, and the choice matters behind a gateway. The reference table documents the per-function form; the schema-level form also works and returns every function in the schema that the caller may execute. Registering the schema-level path is what makes "grant a new function, no gateway change" true — a function-scoped target exposes exactly one tool and needs a new target per function. Both forms were exercised; see [How the table above was established](#how-the-table-above-was-established).
+The per-server scope applies to the **user token** obtained for that surface, not to the M2M credential provider — the `scopes: ["all-apis"]` in the snippet below and in the interceptor's exchange are the provider and OBO requests respectively, and narrowing those to a single surface is a separate change from anything in this table.
+
+Two details on the paths:
+
+- **AI Search** is the current prefix, but the former `/api/2.0/mcp/vector-search/` prefix and `vector-search` scope still work. No need to rewrite a working target; prefer `ai-search` in new code to match the docs.
+- **Unity Catalog functions accepts two path forms.** The reference table documents the per-function form; the schema-level form also works and returns every function in the schema that the caller may execute. Both were exercised — see [How the table was established](#how-the-table-was-established).
 
 ### Registering the additional targets
 
-Each surface is its own gateway target sharing the one credential provider and the one interceptor. `gateway_id`, `provider_arn` and `DATABRICKS_HOST` come from the walkthrough above; the rest identify what you are exposing:
+Each surface is its own gateway target sharing the one credential provider and the one interceptor. `agentcore` (the `bedrock-agentcore-control` boto3 client), `gateway_id`, `provider_arn`, `DATABRICKS_HOST` and `import time` all come from the walkthrough above:
 
 ```python
 CATALOG, SCHEMA = "my_catalog", "my_schema"
@@ -216,35 +222,46 @@ surfaces = {
 
 target_ids = []
 for name, path in surfaces.items():
-    target = agentcore.create_gateway_target(
-        gatewayIdentifier=gateway_id,
-        name=name,
-        description=f"Databricks Managed MCP ({name}) — per-user via interceptor",
-        targetConfiguration={"mcp": {"mcpServer": {"endpoint": f"{DATABRICKS_HOST}{path}"}}},
-        credentialProviderConfigurations=[
-            {
-                "credentialProviderType": "OAUTH",
-                "credentialProvider": {
-                    "oauthCredentialProvider": {
-                        "providerArn": provider_arn,
-                        "grantType": "CLIENT_CREDENTIALS",
-                        "scopes": ["all-apis"],
-                    }
-                },
-            }
-        ],
-    )
-    target_ids.append(target["targetId"])
+    try:
+        target = agentcore.create_gateway_target(
+            gatewayIdentifier=gateway_id,
+            name=name,
+            description=f"Databricks Managed MCP ({name}) — per-user via interceptor",
+            targetConfiguration={"mcp": {"mcpServer": {"endpoint": f"{DATABRICKS_HOST}{path}"}}},
+            credentialProviderConfigurations=[
+                {
+                    "credentialProviderType": "OAUTH",
+                    "credentialProvider": {
+                        "oauthCredentialProvider": {
+                            "providerArn": provider_arn,
+                            "grantType": "CLIENT_CREDENTIALS",
+                            "scopes": ["all-apis"],
+                        }
+                    },
+                }
+            ],
+        )
+        target_ids.append(target["targetId"])
+    except agentcore.exceptions.ConflictException:
+        # Re-runnable: adopt the existing target instead of aborting the rest.
+        existing = next(
+            t for t in agentcore.list_gateway_targets(gatewayIdentifier=gateway_id)["items"]
+            if t["name"] == name
+        )
+        target_ids.append(existing["targetId"])
 
-# Every target must reach READY before it can sync — syncing one that is still
-# CREATING yields no tools. Status values are upper-case per the API's enum
-# (CREATING, UPDATING, READY, FAILED, ...), so compare against those exactly.
+# Wait for READY. Status values are upper case; these are the transient ones, and
+# anything else that is not READY is terminal.
+TRANSIENT = {
+    "CREATING", "UPDATING", "SYNCHRONIZING",
+    "CREATE_PENDING_AUTH", "UPDATE_PENDING_AUTH", "SYNCHRONIZE_PENDING_AUTH",
+}
 for name, target_id in zip(surfaces, target_ids):
     status = None
     for _ in range(24):
         t = agentcore.get_gateway_target(gatewayIdentifier=gateway_id, targetId=target_id)
         status = t.get("status")
-        if status not in ("CREATING", "UPDATING"):
+        if status not in TRANSIENT:
             break
         time.sleep(5)
     if status != "READY":
@@ -255,31 +272,46 @@ agentcore.synchronize_gateway_targets(
 )
 ```
 
-The service principal behind `provider_arn` is what performs `tools/list` at sync time, so it needs enough grant to *see* each surface: `EXECUTE` on the functions you want listed, and `CAN_READ` or better on the Genie space. A surface the SP cannot see syncs zero tools — the failure is silent for functions (empty list) and loud for Genie (`PERMISSION_DENIED`), which is the same asymmetry the table below describes.
+The service principal behind `provider_arn` is what performs `tools/list` at sync time, so it needs enough grant to *see* each surface: `EXECUTE` on the functions you want listed, and `CAN_READ` or better on the Genie space. A surface the SP cannot see should sync no tools for that target; I have not exercised the sync path, so I cannot say whether that surfaces as an empty tool list, a `SYNCHRONIZE_UNSUCCESSFUL` target status, or an error — check the target's `status` and `statusReasons` rather than assuming.
 
 ### Where governance is enforced differs per surface
 
-Carrying the user's identity is necessary but not sufficient — what the identity *buys* you is not the same everywhere. This matters when designing an agent, because on one surface an ungranted tool disappears from the model's tool list, and on another it is offered and then fails at call time.
+**Measured by calling the Managed MCP endpoints directly**, with each principal presenting its own token. See the next section for how a Gateway changes this.
 
 | Surface | `tools/list` gated by | Call gated by | Basis |
 |---|---|---|---|
 | Unity Catalog functions | **`EXECUTE` grant** — an ungranted function is *absent* from the list | `EXECUTE` grant | measured |
-| DBSQL | nothing — the same three tools are returned to every caller | **row filters and column masks**, applied at query time | measured |
+| DBSQL | nothing — the same three tools (`execute_sql`, `execute_sql_read_only`, `poll_sql_result`) go to every caller | **row filters and column masks**, applied at query time | measured |
 | Genie, one space | **the Genie space ACL** — `CAN_READ` is sufficient — checked before Unity Catalog | space ACL, then Unity Catalog on the underlying tables | ACL measured; Unity Catalog layer inferred |
 | AI Search | index-level grant | index-level grant only — no row or column enforcement | Databricks docs, not measured |
 
-The functions surface has the strongest property: a caller without `EXECUTE` never learns the tool exists, so the model cannot attempt it and no denial has to be explained. Genie is the opposite shape — a workspace object ACL is checked first, so a caller without space permission fails at `tools/list` with `PERMISSION_DENIED` rather than receiving an empty list. The Genie row describes the per-space server; Genie One is workspace-wide and has no single space ACL to key on.
+Called directly, the functions surface has a useful property: a caller without `EXECUTE` never learns the tool exists, so a model driving it cannot attempt the call and no denial has to be explained. Genie is the opposite shape — a workspace object ACL is checked first, so a caller without space permission fails at `tools/list` with `PERMISSION_DENIED` rather than receiving an empty list. The Genie row describes the per-space server; Genie One is workspace-wide and has no single space ACL to key on.
+
+### What changes behind a Gateway
+
+The visibility column above does **not** survive a gateway, and this is worth designing around rather than discovering.
+
+Two mechanisms combine:
+
+- **Tool listing is served from an SP-built cache.** `mcpServer.listingMode` defaults to `DEFAULT`, documented as: *"MCP resources for default targets are cached at the control plane for faster access. MCP resources for dynamic targets will be dynamically retrieved when listing tools."* The cache is populated by `synchronize_gateway_targets`, which authenticates as the credential provider's service principal — the walkthrough's own control-plane diagram says exactly this.
+- **The interceptor deliberately does not touch listing.** It returns early for `tools/list` without swapping the header, so even with `listingMode="DYNAMIC"` the upstream list is fetched with the SP's token, never the caller's.
+
+So every caller sees the tools the *service principal* can see. On the functions surface a user with no `EXECUTE` is still offered the tool and gets a denial when the call reaches Unity Catalog — the inverse of the direct-call behaviour. In effect a gateway collapses the functions surface into the DBSQL shape: no visibility gate, enforcement at call time.
+
+Call-time enforcement is unaffected, because that is the leg the interceptor rewrites. Per-user *data* access still holds on every surface. It is only per-user *tool visibility* that does not.
+
+Getting visibility back would take `listingMode="DYNAMIC"` **and** an interceptor that exchanges the token for `tools/list` too, instead of passing it through. I have not tried that combination, and whether it is supported is a question for the AgentCore team rather than an assumption to build on.
 
 ### AI Search: row and column permissions are not part of the picture
 
-Two documented constraints, and they work together rather than leaving a gap:
+Two documented constraints that work together rather than leaving a gap:
 
-- **You cannot create an AI Search index from a table that has row filters or column masks applied.** Index creation is refused, so this is caught up front rather than discovered in production.
+- **You cannot create an AI Search index from a table that has row filters or column masks applied.** Index creation is refused, so this is caught up front rather than in production.
 - **Row and column level permissions are not supported on an index.** The documented alternative is application-level ACLs via the filter API.
 
-The design consequence is what carries over to an agent: on this surface there is no way to push per-user row scoping down to Unity Catalog. If the retrieval corpus needs row scoping, either keep the sensitive columns behind a Unity Catalog function or a governed table — where filters and masks do apply — or scope the retrieval yourself.
+The design consequence: on this surface there is no way to push per-user row scoping down to Unity Catalog. If the corpus needs row scoping, keep the sensitive columns behind a Unity Catalog function or a governed table — where filters and masks do apply — or scope retrieval yourself.
 
-On the Managed MCP surface the scoping mechanism is the `_meta` preset block on the tool call, set by whoever registers the target, with the agent supplying only the `query` argument:
+Scoping it yourself means the `_meta` block on the tool call, which Databricks documents as *"configuration parameters that you can preset in your agent code to set behavior deterministically"*:
 
 ```json
 {
@@ -293,18 +325,18 @@ On the Managed MCP surface the scoping mechanism is the `_meta` preset block on 
 }
 ```
 
-Whatever value you filter on has to come from the verified caller identity on a trusted server-side path. Deriving it from anything the model can influence gives up the property you were trying to buy. Note also that querying an index through this server requires Databricks managed embeddings.
+Note where that can be set. There is no target-registration field that injects `_meta` into forwarded calls — `mcpServer` takes only `endpoint`, `mcpToolSchema`, `listingMode` and `resourcePriority`, and `mcpToolSchema` is *"supported only when the credential provider is configured with an authorization code grant type"*, which this sample is not. So behind a gateway the choices are trusted agent code or an interceptor that rewrites the request body. Whichever you pick, the value filtered on has to come from the verified caller identity: derived from anything the model can influence, it stops being a control. Querying an index through this server also requires Databricks managed embeddings.
 
-### How the table above was established
+### How the table was established
 
-The measured rows were produced with two Databricks service principals holding differential grants, each calling the endpoints above with its own token, on a workspace running Managed MCP:
+The measured rows were produced with two Databricks service principals holding differential grants, each calling the endpoints **directly** with its own token, on a workspace running Managed MCP:
 
-- **Functions** — one principal held `EXECUTE` on two functions, the other on one. On the schema-level path, `tools/list` returned two tools and one tool respectively; the ungranted function was absent rather than present-and-denied. On the per-function path for the ungranted function, the same principal received `BAD_REQUEST: Function '…' not found` — reported as nonexistent rather than forbidden, which is the same visibility property expressed as an error.
+- **Functions** — one principal held `EXECUTE` on two functions, the other on one. On the schema-level path, `tools/list` returned two tools and one tool respectively; the ungranted function was absent rather than present-and-denied. On the per-function path for the ungranted function, the same principal received `BAD_REQUEST: Function '…' not found` — reported as nonexistent rather than forbidden, the same visibility property expressed as an error.
 - **Both functions path forms** — schema-level returned every `EXECUTE`-granted function in the schema; the per-function form returned exactly the one named. Both are live.
 - **DBSQL** — both principals received the identical three tools. A `SELECT` over the same table then returned disjoint row sets, with a masked column for one principal and the raw value for the other.
-- **Genie** — with no space grant, both principals failed `tools/list` with `PERMISSION_DENIED`. Granting `CAN_RUN` to one, then `CAN_READ` to the other, gave both the same two tools: `CAN_READ` is enough to list, and the user-facing "Can View" wording in the denial corresponds to `CAN_READ` at the permissions API, which has no `CAN_VIEW` level.
+- **Genie** — with no space grant, both principals failed `tools/list` with `PERMISSION_DENIED`. Granting `CAN_RUN` to one and `CAN_READ` to the other gave both the same two tools: `CAN_READ` is enough to list. The user-facing "Can View" wording in the denial corresponds to `CAN_READ` at the permissions API, which has no `CAN_VIEW` level.
 
-The AI Search row is from Databricks' documentation rather than measurement. Genie's second layer — Unity Catalog grants on the tables behind the space — is the same mechanism demonstrated on DBSQL but was not separately measured. Genie One, the workspace-wide variant, is from the documented server list and was not exercised.
+The AI Search row is from Databricks' documentation rather than measurement. Genie's second layer — Unity Catalog grants on the tables behind the space — is the same mechanism demonstrated on DBSQL but was not separately measured. Genie One was not exercised. The gateway behaviour in [What changes behind a Gateway](#what-changes-behind-a-gateway) is derived from the AgentCore API contract and the interceptor's source, not from a running gateway.
 
 Managed MCP is in Public Preview at the time of writing; treat surface behaviour as subject to change.
 
