@@ -15,16 +15,24 @@ Usage:
         --token "$END_USER_JWT"
 
 Exit codes:
-    0  PER_USER            Unity Catalog saw the end user. Per-user delegation is working.
-    1  SERVICE_PRINCIPAL   The call ran as the shared service principal, not the end user.
-    2  EXCHANGE_REFUSED    The service refused the token exchange (commonly a non-allowlisted account).
-    3  CALLER_PERMISSIONS  Your own gateway execution role is missing permissions.
-    4  UNKNOWN             Could not determine. The report explains what was seen.
+     0  PER_USER              Unity Catalog saw the end user. Per-user delegation is working.
+     1  SERVICE_PRINCIPAL     The call ran as the shared service principal, not the end user.
+     2  EXCHANGE_REFUSED      The service refused the token exchange (commonly a non-allowlisted account).
+     3  CALLER_PERMISSIONS    Your own gateway execution role is missing permissions.
+     4  UNKNOWN               Could not determine. The report explains what was seen.
+     5  INBOUND_TOKEN         The token you presented was rejected: expired, or wrong issuer or audience.
+     6  PROVIDER_NOT_FOUND    The credential provider on the target does not exist where the gateway looked.
+     7  TRANSIENT             Rate limited, or a service error. Retry.
+     8  TARGET_REJECTED_TOKEN The exchange succeeded and Databricks rejected the token it delivered.
+     9  TARGET_NOT_FOUND      No tool matched --target-name, or the target contributed no tools.
+    10  IDENTITY_MISMATCH     current_user() is not the subject claim in the token you presented.
+    11  PER_USER_UNVERIFIED   A human-shaped principal, but the claim could not be compared. Not a pass.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -41,7 +49,13 @@ PER_USER = "PER_USER"
 SERVICE_PRINCIPAL = "SERVICE_PRINCIPAL"
 EXCHANGE_REFUSED = "EXCHANGE_REFUSED"
 CALLER_PERMISSIONS = "CALLER_PERMISSIONS"
-TARGET_UNREACHABLE = "TARGET_UNREACHABLE"
+TARGET_REJECTED_TOKEN = "TARGET_REJECTED_TOKEN"
+TARGET_NOT_FOUND = "TARGET_NOT_FOUND"
+INBOUND_TOKEN = "INBOUND_TOKEN"
+PROVIDER_NOT_FOUND = "PROVIDER_NOT_FOUND"
+TRANSIENT = "TRANSIENT"
+IDENTITY_MISMATCH = "IDENTITY_MISMATCH"
+PER_USER_UNVERIFIED = "PER_USER_UNVERIFIED"
 WORKSPACE_MEMBERSHIP = "WORKSPACE_MEMBERSHIP"
 GATEWAY_UNREACHABLE = "GATEWAY_UNREACHABLE"
 UNKNOWN = "UNKNOWN"
@@ -52,9 +66,15 @@ EXIT_CODES = {
     EXCHANGE_REFUSED: 2,
     CALLER_PERMISSIONS: 3,
     UNKNOWN: 4,
-    TARGET_UNREACHABLE: 4,
     WORKSPACE_MEMBERSHIP: 4,
     GATEWAY_UNREACHABLE: 4,
+    INBOUND_TOKEN: 5,
+    PROVIDER_NOT_FOUND: 6,
+    TRANSIENT: 7,
+    TARGET_REJECTED_TOKEN: 8,
+    TARGET_NOT_FOUND: 9,
+    IDENTITY_MISMATCH: 10,
+    PER_USER_UNVERIFIED: 11,
 }
 
 _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
@@ -70,10 +90,33 @@ REMEDY_WORKSPACE_MEMBERSHIP = (
     "Identity mapping worked and provisioning is the gap: the federation policy resolved the end user, but "
     "that user is not a member of the target Databricks workspace. Add them to the workspace."
 )
-REMEDY_TARGET_UNREACHABLE = (
-    "The gateway could not fetch tools from the MCP server. Set mcp.mcpServer.listingMode to DYNAMIC on the "
-    "target, and confirm the service principal holds the workspace-access and databricks-sql-access "
-    "entitlements (re-mint its token after granting them)."
+REMEDY_TARGET_REJECTED_TOKEN = (
+    "The exchange succeeded and Databricks rejected the token that was delivered, so this is authorization "
+    "at the target rather than identity. In order of how often we have seen it: the target's oauth scopes "
+    "do not include all-apis; the identity lacks the workspace-access and databricks-sql-access "
+    "entitlements (re-mint its token after granting them); the credential provider's discovery host is not "
+    "the workspace host the target points at; or the caller has no permission on the warehouse, Genie "
+    "space or function being called. The same message at target sync time is a different problem - see the "
+    "README."
+)
+REMEDY_TARGET_NOT_FOUND = (
+    "No tool matched the target name. Either --target-name is wrong, or the target contributed no tools: an "
+    "exchange that fails at listing time on a DYNAMIC target drops it out of tools/list with no error. Call "
+    "tools/list yourself to see which targets are present, and see the listingMode note in the README."
+)
+REMEDY_INBOUND_TOKEN = (
+    "The token you presented was rejected before the exchange: expired, or carrying an issuer or audience "
+    "the gateway authorizer does not accept. Mint a fresh one and check its iss and aud against the "
+    "authorizer's discoveryUrl and allowedAudience."
+)
+REMEDY_PROVIDER_NOT_FOUND = (
+    "The credential provider named on the target does not exist where the gateway looked. Check the "
+    "providerArn on the target, and that the provider lives in the same Region as the gateway."
+)
+REMEDY_TRANSIENT = (
+    "Rate limiting or a service error rather than a misconfiguration, so retry before changing anything. "
+    "This is matched on the message text alone and both the exchange and the target can emit it, so read "
+    "the detail field to see which one did, and give AWS the verbatim text if it persists."
 )
 REMEDY_EXCHANGE_REFUSED = (
     "The exchange was refused. Databricks issues a per-user token only when no client authentication is "
@@ -102,14 +145,42 @@ REMEDY_UNPARSEABLE = (
     "an application UUID lands here — a workspace whose usernames are not email-shaped will do it — so "
     "read the detail field before concluding delegation is broken."
 )
+REMEDY_IDENTITY_MISMATCH = (
+    "Unity Catalog saw a human, but not the human in the token you presented, so an email-shaped principal "
+    "is not on its own proof of per-user delegation. Commonly a shared account whose username is "
+    "email-shaped, or a federation policy whose subject_claim reads a different claim than --subject-claim."
+)
 REMEDY_PER_USER = "Per-user delegation is working. Unity Catalog is enforcing the end user's own grants."
+REMEDY_PER_USER_UNCHECKED = (
+    "Unity Catalog saw a human-shaped principal, but the claim named by --subject-claim is not in the token "
+    "presented, so nothing was compared and a shared account with an email-shaped username would look "
+    "identical. This deliberately does not exit 0. Name the claim your federation policy maps: a Cognito "
+    "access token, for one, carries no email claim at all."
+)
+REMEDY_SUBJECT_NOT_COMPARABLE = (
+    "Unity Catalog saw a human-shaped principal and the claim read from the token is opaque, which sub is "
+    "on both Entra and Cognito, so the two cannot be compared and their disagreement proves nothing either "
+    "way. Point --subject-claim at the claim your federation policy maps to a username, commonly email or "
+    "preferred_username. This deliberately does not exit 0."
+)
 
-# Ordered most specific first: several of these messages share substrings.
+# Ordered most specific first: several of these messages share substrings. In particular the service
+# prefixes distinct failures with "Token exchange failed:", so every specific variant has to sit above
+# that catch-all or it inherits the enablement remedy, which is wrong for an expired token, a missing
+# provider or a rate limit.
 FAILURE_SIGNATURES = (
     ("insufficient permissions for token exchange", CALLER_PERMISSIONS, REMEDY_CALLER_PERMISSIONS),
     ("is not a member of workspace", WORKSPACE_MEMBERSHIP, REMEDY_WORKSPACE_MEMBERSHIP),
-    ("authorization error when sending message", TARGET_UNREACHABLE, REMEDY_TARGET_UNREACHABLE),
+    ("no target found for capability", TARGET_NOT_FOUND, REMEDY_TARGET_NOT_FOUND),
+    ("inbound token is invalid", INBOUND_TOKEN, REMEDY_INBOUND_TOKEN),
+    ("credential provider not found", PROVIDER_NOT_FOUND, REMEDY_PROVIDER_NOT_FOUND),
+    ("rate limited", TRANSIENT, REMEDY_TRANSIENT),
+    ("token exchange encountered a service error", TRANSIENT, REMEDY_TRANSIENT),
     ("check credential provider scopes, audience, or idp configuration", EXCHANGE_REFUSED, REMEDY_EXCHANGE_REFUSED),
+    # A wrapper, not a leaf: the client reports it as "MCP listTools failed: Authorization error when
+    # sending message", sometimes with the underlying cause appended. It sits below the leaves so a
+    # composite message is classified by its cause rather than by the wrapper.
+    ("authorization error when sending message", TARGET_REJECTED_TOKEN, REMEDY_TARGET_REJECTED_TOKEN),
     ("token exchange failed", EXCHANGE_REFUSED, REMEDY_EXCHANGE_FAILED_GENERIC),
 )
 
@@ -131,6 +202,32 @@ def classify_identity(value: str | None) -> str:
     return UNKNOWN
 
 
+def subject_from_token(token: str | None, claim: str = "email") -> str | None:
+    """Read one claim out of the token the caller presented, without verifying it.
+
+    By the time this runs the gateway authorizer and Databricks have both validated the token, so there is
+    nothing to gain from verifying it again here — it is read only to compare who was presented with who
+    arrived. Anything unreadable returns None and the comparison is skipped rather than failed.
+    """
+    if not token or not claim:
+        return None
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    segment = parts[1]
+    try:
+        # JWT segments are base64url with the padding stripped; put it back before decoding.
+        payload = json.loads(base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4)))
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get(claim)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip()
+
+
 def classify_failure(text: str | None) -> tuple[str, str]:
     """Map an error string from the gateway to a cause and a remedy."""
     if not text:
@@ -140,6 +237,28 @@ def classify_failure(text: str | None) -> tuple[str, str]:
         if needle in haystack:
             return verdict, remedy
     return UNKNOWN, REMEDY_UNRECOGNISED
+
+
+def resolve_identity(shape: str, identity: str | None, subject: str | None) -> tuple[str, str]:
+    """Decide the verdict from the principal that arrived and the subject claim that was presented.
+
+    The shape of the principal alone is weak evidence in both directions: a shared service account with an
+    email-shaped username looks like a human, and a workspace whose usernames are not email-shaped makes a
+    real human look unclassifiable. An exact match against the presented claim outranks both.
+    """
+    if shape == SERVICE_PRINCIPAL:
+        return SERVICE_PRINCIPAL, REMEDY_SERVICE_PRINCIPAL
+    arrived = (identity or "").strip()
+    if subject and arrived and subject.casefold() == arrived.casefold():
+        return PER_USER, REMEDY_PER_USER
+    if shape == PER_USER:
+        if subject is None:
+            return PER_USER_UNVERIFIED, REMEDY_PER_USER_UNCHECKED
+        if _EMAIL.match(subject):
+            # Two different humans: this is the false positive the comparison exists to catch.
+            return IDENTITY_MISMATCH, REMEDY_IDENTITY_MISMATCH
+        return PER_USER_UNVERIFIED, REMEDY_SUBJECT_NOT_COMPARABLE
+    return UNKNOWN, REMEDY_UNPARSEABLE
 
 
 def qualified_tool_name(target_name: str, tool_name: str) -> str:
@@ -278,9 +397,11 @@ def mcp_post(url: str, token: str, payload: dict, protocol_version: str | None, 
     except urllib.error.HTTPError as exc:
         # An MCP error arrives as a normal body on a non-2xx response, so this is not a transport failure.
         body = exc.read().decode("utf-8", "replace")
-    except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
+    except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:  # noqa: UP041
         # HTTPError is a subclass of URLError and is handled above, so reaching here means the
         # request never got an HTTP response: bad host, refused connection, or the read timed out.
+        # socket.timeout is an alias of TimeoutError from 3.10 on, but a distinct OSError subclass
+        # before that, so both are listed and the linter is told to leave it alone.
         raise GatewayUnreachable(f"{url}: {getattr(exc, 'reason', exc)}") from exc
     return parse_mcp_body(body, expected_id=payload.get("id"))
 
@@ -330,7 +451,15 @@ def _query_timeout() -> int:
 QUERY_TIMEOUT = _query_timeout()
 
 
-def run_check(url: str, token: str, target_name: str, tool_name: str, query: str, requested_version: str) -> dict:
+def run_check(
+    url: str,
+    token: str,
+    target_name: str,
+    tool_name: str,
+    query: str,
+    requested_version: str,
+    subject_claim: str = "email",
+) -> dict:
     """Run the identity probe and return a verdict dictionary."""
     negotiated = negotiate(url, token, requested_version)
     payload = {
@@ -348,16 +477,13 @@ def run_check(url: str, token: str, target_name: str, tool_name: str, query: str
         verdict, remedy = classify_failure(text or json.dumps(response.get("error") or {}))
         return {"verdict": verdict, "remedy": remedy, "detail": text, "protocol_version": negotiated}
     identity = extract_identity(text)
-    verdict = classify_identity(identity)
-    remedies = {
-        PER_USER: REMEDY_PER_USER,
-        SERVICE_PRINCIPAL: REMEDY_SERVICE_PRINCIPAL,
-        UNKNOWN: REMEDY_UNPARSEABLE,
-    }
+    subject = subject_from_token(token, subject_claim)
+    verdict, remedy = resolve_identity(classify_identity(identity), identity, subject)
     return {
         "verdict": verdict,
-        "remedy": remedies[verdict],
+        "remedy": remedy,
         "identity": identity,
+        "subject": subject,
         "detail": None if verdict == PER_USER else text,
         "protocol_version": negotiated,
     }
@@ -373,6 +499,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tool-name", default=DEFAULT_TOOL, help=f"Tool to call (default: {DEFAULT_TOOL})")
     parser.add_argument("--query", default=DEFAULT_QUERY, help=f"SQL to run (default: {DEFAULT_QUERY})")
     parser.add_argument("--protocol-version", default="2025-06-18", help="MCP version to request at initialize")
+    parser.add_argument(
+        "--subject-claim",
+        default="email",
+        help="Claim in the presented token that your federation policy maps to a user (default: email)",
+    )
     parser.add_argument("--json", action="store_true", help="Emit the verdict as JSON")
     return parser
 
@@ -381,7 +512,13 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         result = run_check(
-            args.gateway_url, args.token, args.target_name, args.tool_name, args.query, args.protocol_version
+            args.gateway_url,
+            args.token,
+            args.target_name,
+            args.tool_name,
+            args.query,
+            args.protocol_version,
+            args.subject_claim,
         )
     except GatewayUnreachable as exc:
         result = {"verdict": GATEWAY_UNREACHABLE, "remedy": REMEDY_GATEWAY_UNREACHABLE, "detail": str(exc)}
@@ -393,6 +530,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"verdict : {result['verdict']}")
         if result.get("identity"):
             print(f"identity: {result['identity']}")
+        if result.get("subject"):
+            print(f"subject : {result['subject']}")
         print(f"meaning : {result['remedy']}")
         if result.get("detail"):
             print(f"detail  : {result['detail']}")

@@ -83,12 +83,26 @@ check before you trust the path:
 python check_obo_identity.py \
   --gateway-url https://<gateway-id>.gateway.bedrock-agentcore.<region>.amazonaws.com/mcp \
   --target-name <your-target> \
-  --token "$END_USER_JWT"
+  --token "$END_USER_JWT" \
+  --subject-claim email
 ```
 
 It creates and changes nothing. The identity query runs on a SQL warehouse that may be cold, so it
 gets a 180s budget rather than the handshake's 60s — a cold start that timed out would otherwise be
 reported as `UNKNOWN` for a target that is configured correctly. Override with `OBO_QUERY_TIMEOUT`.
+
+The check also reads the token you pass and compares the claim your federation policy maps
+(`--subject-claim`, default `email`) with the principal Unity Catalog reports. The shape of the principal
+is weak evidence in both directions — a shared service account whose username is an email address looks
+exactly like a human, and a workspace whose usernames are not email-shaped makes a real human look
+unclassifiable — so an exact match against the claim outranks the shape either way. Two different
+email-shaped identities are `IDENTITY_MISMATCH`.
+
+A comparison that could not be made is `PER_USER_UNVERIFIED`, which exits non-zero on purpose: exit 0 on
+an unverified check is the same green as a verified one, and that is the hole this exists to close. Two
+common cases: a Cognito access token carries no `email` claim at all, and `sub` is an opaque GUID on both
+Entra and Cognito, so it cannot be a Databricks username and its disagreement proves nothing. Point
+`--subject-claim` at the claim your federation policy actually maps.
 
 Verdicts and exit codes:
 
@@ -99,9 +113,20 @@ Verdicts and exit codes:
 | `EXCHANGE_REFUSED` | 2 | The exchange was refused. Work through the prerequisites, then ask whether the account and Region are enabled. |
 | `CALLER_PERMISSIONS` | 3 | Your own execution role. Check CloudTrail for `AccessDenied`. |
 | `WORKSPACE_MEMBERSHIP` | 4 | Identity resolved; the user is not a workspace member. |
-| `TARGET_UNREACHABLE` | 4 | Gateway could not fetch tools. See `listingMode` below. |
 | `GATEWAY_UNREACHABLE` | 4 | The gateway URL itself was not reachable, so nothing was tested. Transport, not identity: check the URL, the Region in the hostname, and egress. |
 | `UNKNOWN` | 4 | Could not determine; the report prints what was seen. |
+| `INBOUND_TOKEN` | 5 | The token you presented was rejected before the exchange: expired, or an issuer or audience the authorizer does not accept. |
+| `PROVIDER_NOT_FOUND` | 6 | The credential provider named on the target does not exist where the gateway looked. Check `providerArn`, and that the provider is in the gateway's Region. |
+| `TRANSIENT` | 7 | Rate limited, or a service error. Nothing is misconfigured on this evidence; retry. |
+| `TARGET_REJECTED_TOKEN` | 8 | The exchange succeeded and Databricks rejected the delivered token. Check `all-apis` in the target's scopes, that the provider's discovery host matches the workspace host the target points at, and the caller's own permission on the warehouse, Genie space or function. |
+| `TARGET_NOT_FOUND` | 9 | No tool matched `--target-name`, or the target contributed no tools — see the `listingMode` note below. |
+| `IDENTITY_MISMATCH` | 10 | Unity Catalog saw a human, but not the human in the token presented. Commonly a shared account with an email-shaped username. |
+| `PER_USER_UNVERIFIED` | 11 | A human-shaped principal, but the claim could not be compared: absent from the token, or opaque. Not a pass. |
+
+The `insufficient permissions for token exchange`, `is not a member of workspace`, `scopes, audience, or
+IdP configuration` and `Authorization error when sending message` mappings were observed against a live
+gateway. `INBOUND_TOKEN`, `PROVIDER_NOT_FOUND`, `TRANSIENT` and `TARGET_NOT_FOUND` come from the
+service-side message list supplied in review of this sample, and are not from a run of our own.
 
 ## Notes that save time
 
