@@ -12,8 +12,8 @@ No Lambda interceptor is required.
 outcome with a Gateway REQUEST interceptor, because it was written when Gateway supported only
 `CLIENT_CREDENTIALS` and `AUTHORIZATION_CODE` for outbound auth. Gateway now supports `TOKEN_EXCHANGE`
 natively, so the interceptor is no longer needed. The native path needs no account allowlisting once the
-credential provider sets `onBehalfOfAuthenticationConfig` to `NO_CLIENT` (see
-[Prerequisites](#prerequisites)); the interceptor sample remains an alternative.
+credential provider sets `onBehalfOfAuthenticationConfig.clientAuthenticationMethod` to `NO_CLIENT`
+(see [Prerequisites](#prerequisites)); the interceptor sample remains an alternative.
 
 ## How it works
 
@@ -43,10 +43,12 @@ Three objects and no code: an inbound `CUSTOM_JWT` authorizer, a credential prov
    an AWS SDK that includes the setting, and needs no account allowlisting. An
    existing provider can be updated with `update-oauth2-credential-provider`; that call takes the whole
    `oauth2ProviderConfigInput`, so pass the provider's complete configuration with the setting added,
-   not the new field alone. The provider still takes a
-   `clientId` and `clientSecret`; with `NO_CLIENT` they are not sent on the on-behalf-of exchange.
-   Without it, the Gateway authenticates with them and the exchange is refused. This is the single most
-   common reason a correct configuration still fails.
+   not the new field alone. The API still requires a `clientId` and `clientSecret`, and creating the
+   provider fails without them, but with `NO_CLIENT` they are not sent on the on-behalf-of exchange, so
+   placeholder values are fine when the target's `listingMode` is `DYNAMIC` (see item 5). Without
+   `NO_CLIENT` the Gateway authenticates with them, and the exchange is refused unless the account was
+   enabled under the earlier per-account arrangement. Set `NO_CLIENT` everywhere, including in accounts
+   that were enabled that way. This is the single most common reason a correct configuration still fails.
 2. **Gateway execution role.** Secrets Manager read on the token vault secret, KMS decrypt through
    Secrets Manager, and the AgentCore Identity token operations. Do **not** pin these to one Region —
    a Region-pinned policy produces `AccessDenied`, which Gateway reports as
@@ -118,7 +120,7 @@ Verdicts and exit codes:
 |---|---|---|
 | `PER_USER` | 0 | Unity Catalog saw the end user. Working. |
 | `SERVICE_PRINCIPAL` | 1 | Ran as the shared identity. Check `grantType` is `TOKEN_EXCHANGE` on both the provider and the target. |
-| `EXCHANGE_REFUSED` | 2 | The exchange was refused. Check the credential provider sets `onBehalfOfAuthenticationConfig` to `NO_CLIENT`, then work through the other prerequisites. |
+| `EXCHANGE_REFUSED` | 2 | The exchange was refused. Check the credential provider sets `onBehalfOfAuthenticationConfig.clientAuthenticationMethod` to `NO_CLIENT`, then work through the other prerequisites. |
 | `CALLER_PERMISSIONS` | 3 | Your own execution role. Check CloudTrail for `AccessDenied`. |
 | `WORKSPACE_MEMBERSHIP` | 4 | Identity resolved; the user is not a workspace member. |
 | `GATEWAY_UNREACHABLE` | 4 | The gateway URL itself was not reachable, so nothing was tested. Transport, not identity: check the URL, the Region in the hostname, and egress. |
